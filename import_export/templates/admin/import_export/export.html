@@ -1,5 +1,6 @@
 {% extends "admin/import_export/base.html" %}
 {% load i18n %}
+{% load l10n %}
 {% load admin_urls %}
 {% load import_export_tags %}
 
@@ -11,6 +12,9 @@
 <form action="" method="POST">
   {% csrf_token %}
 
+    {% if count %}
+      <p>{{ count }} {{ model_verbose_name }} selected for export.</p>
+    {% endif %}
     <fieldset class="module aligned">
       {% for field in form %}
         <div class="form-row">
@@ -25,10 +29,16 @@
           {% endif %}
         </div>
       {% endfor %}
+
+      {% for obj in queryset %}
+      <input type="hidden" name="{{ action_checkbox_name }}" value="{{ obj.pk|unlocalize }}">
+      {% endfor %}
+      <input type="hidden" name="action" value="export_admin_action">
+      <input type="hidden" name="post" value="yes">
     </fieldset>
 
     <div class="submit-row">
-      <input type="submit" class="default" value="{% trans "Submit" %}">
+      <input type="submit" class="default" value="{% trans 'Submit' %}">
     </div>
 </form>
 {% endblock %}

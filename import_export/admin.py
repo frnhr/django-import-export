@@ -1,10 +1,16 @@
+import hashlib
+import tempfile
+import logging
 from datetime import datetime
+from os import unlink
 
 import django
 from django.conf import settings
 from django.conf.urls import url
 from django.contrib import admin, messages
+from django.contrib.admin import helpers
 from django.contrib.admin.models import ADDITION, CHANGE, DELETION, LogEntry
+from django.contrib.admin.templatetags.admin_urls import add_preserved_filters
 from django.contrib.auth import get_permission_codename
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import PermissionDenied
@@ -12,8 +18,9 @@ from django.http import HttpResponse, HttpResponseRedirect
 from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.decorators import method_decorator
-from django.utils.encoding import force_text
+from django.utils.encoding import force_text, force_bytes
 from django.utils.module_loading import import_string
+from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_POST
 
@@ -23,6 +30,10 @@ from .resources import modelresource_factory
 from .results import RowResult
 from .signals import post_export, post_import
 from .tmp_storages import TempFolderStorage
+
+
+log = logging.getLogger(__name__)
+
 
 SKIP_ADMIN_LOG = getattr(settings, 'IMPORT_EXPORT_SKIP_ADMIN_LOG', False)
 TMP_STORAGE_CLASS = getattr(settings, 'IMPORT_EXPORT_TMP_STORAGE_CLASS',
@@ -523,6 +534,7 @@ class ImportExportModelAdmin(ImportExportMixin, admin.ModelAdmin):
 class ExportActionMixin(ExportMixin):
     """
     Mixin with export functionality implemented as an admin action.
+    Format is chosen with a dropdown in the changelist header.
     """
 
     # Don't use custom change list template.
@@ -567,8 +579,152 @@ class ExportActionMixin(ExportMixin):
 
     actions = [export_admin_action]
 
-    class Media:
-        js = ['import_export/action_formats.js']
+
+class ExportConfirmActionMixin(ExportMixin):
+    """
+    Mixin with export functionality implemented as an admin action.
+    Format is chosen on a separate view.
+    """
+
+    # Don't use custom change list template.
+    change_list_template = ''
+    _session_key = 'import_export_dl'
+    _hash_len = 12
+
+    def get_urls(self):
+        urls = super().get_urls()
+        my_urls = [
+            url(r'^export/download/$',
+                self.admin_site.admin_view(self.export_download),
+                name='%s_%s_exportdl' % self.get_model_info()),
+        ]
+        return my_urls + urls
+
+    def export_download(self, request, *args, **kwargs):
+        if not self.has_export_permission(request):
+            raise PermissionDenied
+
+        file_hash = request.GET.get('h')
+        try:
+            file_data = request.session.get(self._session_key)[file_hash]
+            filename = file_data['filename']
+            file_path = file_data['file_path']
+            content_type = file_data['content_type']
+            file_path = file_data['file_path']
+        except KeyError:
+            msg = 'Error downloading file, please try the export again'
+            log.exception(msg)
+            self.message_user(request, msg, messages.ERROR)
+
+        try:
+            with open(file_path, 'rb') as tmp:
+                response = HttpResponse(tmp.read(), content_type=content_type)
+                response['Content-Disposition'] = 'attachment; filename={}'.format(
+                    filename,
+                )
+                return response
+        except FileNotFoundError:
+            msg = ('File not found. It is likely that the file has already '
+                   'been downloaded. Please try the export again.')
+            self.message_user(request, msg, messages.WARNING)
+            context = self.get_export_context_data()
+            context.update(self.admin_site.each_context(request))
+            context['opts'] = self.model._meta
+            context['title'] = 'Export'
+            context['msg'] = ''
+            request.current_app = self.admin_site.name
+            return TemplateResponse(request, [
+                'admin/import_export/message.html',
+            ], context)
+        finally:
+            try:
+                unlink(file_path)
+            except:
+                pass
+            del request.session[self._session_key][file_hash]
+
+    # noinspection PyProtectedMember
+    def export_admin_action(self, request, queryset):
+        """
+        Exports the selected rows using file_format.
+        """
+
+        if request.method != 'POST':
+            raise ValueError('Action should always be called with a POST')
+
+        opts = self.model._meta
+
+        formats = self.get_export_formats()
+        if request.POST.get('post') == 'yes':
+            form = ExportForm(formats, request.POST)
+            if form.is_valid():
+                file_format = formats[
+                    int(form.cleaned_data['file_format'])
+                ]()
+                export_data = self.get_export_data(file_format, queryset,
+                                                   request=request)
+                content_type = file_format.get_content_type()
+
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp.write(force_bytes(export_data))
+                    file_hash = hashlib.sha224(
+                        force_bytes(tmp.name)).hexdigest()[:self._hash_len]
+                post_export.send(sender=None, model=self.model)
+                session_data = request.session.get(self._session_key, {})
+                session_data[file_hash] = {
+                    'file_path': tmp.name,
+                    'content_type': content_type,
+                    'filename': self.get_export_filename(file_format),
+                }
+                request.session[self._session_key] = session_data
+                download_url = reverse(
+                    'admin:{}_{}_exportdl'.format(*self.get_model_info()),
+                    current_app=self.admin_site.name)
+                msg = mark_safe(
+                    '{n} {verbose_name_plural} successfully exported. '
+                    '<a href="{download_url}?h={file_hash}" target="_blank">'
+                    'Click here to download</a>.'
+                    .format(
+                        n=queryset.count(),
+                        verbose_name_plural=opts.verbose_name_plural,
+                        download_url=download_url,
+                        file_hash=file_hash,
+                    )
+                )
+                self.message_user(request, msg, messages.SUCCESS)
+                changelist_url = reverse(
+                    'admin:{}_{}_changelist'.format(*self.get_model_info()),
+                    current_app=self.admin_site.name)
+                preserved_filters = self.get_preserved_filters(request)
+                changelist_url = add_preserved_filters(
+                    {'preserved_filters': preserved_filters, 'opts': opts},
+                    changelist_url)
+                return HttpResponseRedirect(changelist_url)
+        else:
+            form = ExportForm(formats)
+
+        count = queryset.count()
+        model_verbose_name = getattr(
+            opts,
+            'verbose_name' if count == 1 else 'verbose_name_plural')
+
+        context = self.get_export_context_data()
+        context.update(self.admin_site.each_context(request))
+        context['title'] = _("Export")
+        context['form'] = form
+        context['opts'] = self.model._meta
+        context['queryset'] = queryset
+        context['count'] = count
+        context['model_verbose_name'] = model_verbose_name
+        context['action_checkbox_name'] = helpers.ACTION_CHECKBOX_NAME
+        request.current_app = self.admin_site.name
+        return TemplateResponse(
+            request, [self.export_template_name], context)
+
+    export_admin_action.short_description = _(
+        'Export selected %(verbose_name_plural)s')
+
+    actions = [export_admin_action]
 
 
 class ExportActionModelAdmin(ExportActionMixin, admin.ModelAdmin):

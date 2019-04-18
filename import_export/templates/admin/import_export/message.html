@@ -1,0 +1,14 @@
+{% extends "admin/import_export/base.html" %}
+{% load i18n %}
+
+{% block breadcrumbs_last %}
+{% trans "Export" %}
+{% endblock %}
+
+{% block content_title %}{% endblock %}
+
+{% block content %}
+    <div class="submit-row">
+        <a href="#" class="closelink" onclick="window.close()">{% trans 'Close' %}</a>
+    </div>
+{% endblock %}
